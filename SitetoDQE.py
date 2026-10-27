@@ -1,378 +1,494 @@
+"""Move site submissions out of the study projects for review.
 
+  Patient Information (read Complete)  -> <source group>/Participant History
+  Visit 1 OCT / FP acquisitions        -> <source group>/DQE
+  Uploader Acknowledgement             -> <certification group>/Certification Review
+  Certification                        -> <certification group>/Certification Review
+
+Source sessions left without acquisitions are deleted.
+
+Sessions are processed by WORKERS threads (default 4; WORKERS=1 runs them one at a
+time). Each session is read, planned and moved by one thread, so the order inside
+a session is kept: its moves land before its delete. Moves into the same
+destination happen one at a time, and a destination label is only recorded once
+the move that uses it has succeeded.
+
+Reads use small per-container calls (a session's acquisitions, one session) rather
+than project-wide filtered listings. Those listings get slower per call as projects
+grow; the small calls stay flat. See report.html.
+
+Reader tasks are created with your utils/tasks.py exactly where the original
+script creates them (after each Visit 1 move; for an OCT original/companion pair,
+only for the companion).
+
+If a session fails, the error is printed and the run continues. The script exits
+non-zero at the end in that case. Re-running it picks up whatever is left.
+Ctrl-C cancels the sessions that have not started and lets the running ones finish.
+"""
 
 import os
 import re
-import time
-import ast
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+import sys
+import threading
+import traceback
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
-import requests
+import backoff
 import flywheel
 from flywheel.models import ContainerDeleteReason
-from pytz import timezone as pytz_timezone
 from fw_client import FWClient
-from utils.tasks import create_task,get_pool_id_by_label,get_published_protocol_by_label  #local file
+from utils.tasks import create_task  # local file, unchanged
 
 # Configuration
-api_key_path = "/home/myounis/copysubjectscript/api_key.txt"
-LOCAL_TIMEZONE = pytz_timezone("America/Chicago")  
-BASE_URL = "https://wrc.flywheel.io:443/api"
+API_KEY_PATH = os.environ.get(
+    "FW_API_KEY_PATH", "/home/myounis/copysubjectscript/api_key.txt"
+)
+SOURCE_GROUP = os.environ.get("SRC_GROUP", "abiduw")
+CERTIFICATION_GROUP = os.environ.get("CERT_GROUP", "certification")
+EXCLUDED_PROJECTS = {"Completed", "DQE", "Participant History", "Archive"}
+EXCLUDED_INITIALS = {"FP", "FA", "OCT", "FAF", "RE", "LE", "OU", "CERT"}
+WORKERS = int(os.environ.get("WORKERS") or 4)
+PAGE_SIZE = 100
 
-source_group_ID = "abiduw"
-certification_group_ID = "certification"
-excluded_projects = {"Completed", "DQE", "Participant History", "Archive"}
-destination_project_name = "DQE"
-
-excluded_initials = {"FP", "FA", "OCT", "FAF", "RE", "LE", "OU", "CERT"}
-
-# Retry in case Flywheel times out
-def flywheel_modify_with_retry(modify_func, object_id, body, object_type="object", retries=4):
-    for attempt in range(retries):
-        try:
-            return modify_func(object_id, body)
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            if attempt == retries - 1:
-                print(f"ERROR: Could not modify {object_type} {object_id} after {retries} attempts.")
-                raise
-            wait = 10 ** attempt
-            print(
-                f"Flywheel connection/timeout error for {object_type} {object_id}: {e}\n"
-                f"Retrying in {wait}s (attempt {attempt + 2}/{retries})"
-            )
-            time.sleep(wait)
+# Reader task assignment. Copy these four values from your current
+# handle_visit1_session (the "#modify this" lines). Empty values create tasks
+# with no protocol or assignee; the script warns about that when it starts.
+OCT_ASSIGNEE = ""  # modify this
+OCT_PROTOCOL_LABEL = ""  # modify this
+FP_ASSIGNEE = ""  # modify this
+FP_PROTOCOL_LABEL = ""  # modify this
 
 
+def api_key():
+    """(key, source): FW_API_KEY if set, otherwise the key file, as in the original script."""
+    if os.environ.get("FW_API_KEY"):
+        return os.environ["FW_API_KEY"], "the FW_API_KEY environment variable"
+    with open(API_KEY_PATH) as f:
+        return f.read().strip(), API_KEY_PATH
 
-#this is used for certifications, we extract the initial of the Tech
+
 def extract_initials(filename):
+    """Tech initials from a certification file name, e.g. CERT_JD_photos.zip -> JD."""
     for token in re.split(r"[_\W]+", filename):
-        if re.fullmatch(r"[A-Z]{2,3}", token) and token not in excluded_initials:
+        if re.fullmatch(r"[A-Z]{2,3}", token) and token not in EXCLUDED_INITIALS:
             return token
     return None
 
-#for renaming sessions/subjects: This will help certification team figure out to which study the submission belongs
-def extract_prefix(s):
-    number, rest = s.split(" - ", 1)
-    first_word = rest.split()[0]
-    return f"{number} - {first_word}"
+
+def extract_prefix(project_label):
+    """'101 - Alpha Study' -> '101 - Alpha'."""
+    number, rest = project_label.split(" - ", 1)
+    return f"{number} - {rest.split()[0]}"
 
 
-def acq_tags(acq):
-    return acq["tags"] if acq["tags"] else []
-
-#get the files submited
-def site_submission_files(acq):
-    """Files uploaded by the site (not yet processed by DQE)."""
-    return [
-        f for f in acq.files
-        if (f.name.lower().endswith(".dcm.zip")
-            or f.name.lower().endswith(".zip")
-            or f.name.lower().endswith(".pdf"))
-        and "dqe" not in f.name.lower()
-    ]
+def free_label(label, taken):
+    """label, or label_2, label_3, ... whichever is not in taken."""
+    if label not in taken:
+        return label
+    n = 2
+    while f"{label}_{n}" in taken:
+        n += 1
+    return f"{label}_{n}"
 
 
+# The SDK already retries 429/502/503/504 and connection errors, but not 500.
+# Flywheel can return a one-off 500 on a read that succeeds on the next try.
+# Only reads go through this; they are safe to repeat.
+_retry_on_500 = backoff.on_exception(
+    backoff.expo,
+    flywheel.ApiException,
+    max_tries=4,
+    giveup=lambda e: getattr(e, "status", None) != 500,
+)
 
-def resolve_and_move(
-    fw, fw_client, acq, session, project, subject,
-    destination_project, subject_label, session_label,
-    protocol_label, assignee, also_move=None, task_target="self",
-):
-    
-    acq, destination_session = move_acq(fw, acq, destination_project, subject_label, session_label)
-    if task_target == "self":
-        create_task(fw_client, acq, destination_session, protocol_label, assignee)
-    elif task_target == "companion":
-        if also_move is not None:
-            also_move, destination_session = move_acq(fw, also_move, destination_project, subject_label, session_label)
-            create_task(fw_client, also_move, destination_session, protocol_label, assignee)
-    else:
-        raise ValueError(f"Unknown task_target: {task_target}")
 
-    
-# Moving acquisitions / sessions (rename when there is a conflict)
-def rename_and_move_acquisition(fw, acq, destination_session):
+def read(fn, *args, **kwargs):
+    return _retry_on_500(fn)(*args, **kwargs)
+
+
+class Destinations:
+    """Destination containers, looked up once per run and remembered.
+
+    Subjects, a subject's sessions and a session's acquisition labels are each
+    fetched at most once. Containers created here are recorded as empty so they
+    are never fetched. Moves into a destination run under that destination's
+    lock, and the label they use is recorded only after the move succeeds, so
+    two threads never pick the same label and a failed move leaves no trace.
     """
-    If an acquisition with the same label already exists in the destination_session, rename it first then move it
-    """
-    destination_acquisitions = list(destination_session.acquisitions())
-    if any(a.label == acq.label for a in destination_acquisitions):
-        print(f"Acquisition '{acq.label}' already exists in destination. Renaming in source project")
-        timestamp = int(time.time() * 1000) % 1000
-        new_label = f"{acq.label}_{timestamp}"
-        flywheel_modify_with_retry(fw.modify_acquisition, acq.id, {"label": new_label}, object_type="acquisition")
-        acq = fw.get_acquisition(acq.id)
 
-    print(f"Moving acquisition '{acq.label}' to destination session '{destination_session.id}'")
-    flywheel_modify_with_retry(
-        fw.modify_acquisition, acq.id, {"session": destination_session.id}, object_type="acquisition")
-    return acq
+    def __init__(self, fw):
+        self.fw = fw
+        self._subjects = {}  # (project_id, label) -> subject
+        self._sessions = {}  # subject_id -> {label: session}
+        self._acq_labels = {}  # session_id -> set of acquisition labels
+        self._full = {}  # session_id -> full session model (for create_task)
+        self._guard = threading.Lock()
+        self._locks = defaultdict(threading.Lock)
 
+    def _lock(self, key):
+        with self._guard:
+            return self._locks[key]
 
-def move_acq(fw, acq, destination_project, subject_label, session_label):
-    destination_subject = destination_project.subjects.find_one(f'label="{subject_label}"')
-    destination_session = None
-    if destination_subject:
-        destination_session = destination_subject.sessions.find_first(f'label="{session_label}"')
-        if not destination_session:
-            print(f"Creating session '{session_label}' under subject '{subject_label}'")
-            try:
-                destination_session = destination_project.add_session(label=session_label, subject=destination_subject.id)
-            except Exception as e:
-                print(f"Error creating session '{session_label}': {e}")
-        if destination_session:
-            destination_session = destination_session.reload()
-            acq = rename_and_move_acquisition(fw, acq, destination_session)
-    return acq, destination_session
+    def subject(self, project, label):
+        key = (project.id, label)
+        with self._lock(key):
+            if key not in self._subjects:
+                subject = read(project.subjects.find_first, f'label="{label}"')
+                if subject is None:
+                    print(f"Creating subject '{label}' in {project.label}")
+                    # fw.add_subject returns only the id; project.add_subject would also re-fetch it
+                    sid = self.fw.add_subject({"project": project.id, "label": label})
+                    subject = SimpleNamespace(id=sid, label=label, project=project.id)
+                    self._sessions[sid] = {}
+                self._subjects[key] = subject
+            return self._subjects[key]
 
+    def _sessions_of(self, subject):
+        """{label: session} for a destination subject. Callers hold the subject's lock."""
+        if subject.id not in self._sessions:
+            sessions = {}
+            for s in read(self.fw.get_subject_sessions, subject.id):
+                sessions.setdefault(s.label, s)  # first match wins, as in the original
+            self._sessions[subject.id] = sessions
+        return self._sessions[subject.id]
 
-
-# Session-type handlers
-def handle_patient_information_session(fw, group_ids, session, subject, subject_label):
-    session = session.reload()
-    destination_project2 = fw.lookup(f"{group_ids[0]}/Participant History")
-    info = session.info
-
-    viewer_key = None
-    for key in ["ohifViewer"]:
-        if key in info and "read" in info[key]:
-            viewer_key = key
-            break
-    if not viewer_key:
-        return
-
-    reads = info["ohifViewer"]["read"]
-    graders_info = list(reads.keys())
-    if not graders_info or str(reads[graders_info[0]].get("readStatus")) != "Complete":
-        print(f"skipping subject {subject_label} and timepoint {session.label} as patient info is not complete")
-        return
-
-    destination_subject2 = destination_project2.subjects.find_first(f'label="{subject_label}"')
-    if destination_subject2 is None:
-        try:
-            destination_subject2 = destination_project2.subjects.find_one(f'label="{subject_label}"')
-        except ValueError:
-            destination_subject2 = destination_project2.add_subject({"label": subject_label})
-
-    print(f"Moving session '{session.label}' to project '{destination_project2.label}'")
-    destination_sessions = fw.get_subject_sessions(destination_subject2.id)
-    destination_session = next((s for s in destination_sessions if s.label == session.label), None)
-
-    if destination_subject2:
-        print(f"found a destination subject in {destination_project2.label}")
-        if not destination_session:
-            flywheel_modify_with_retry(
-                fw.modify_session, session.id, {"subject": destination_subject2.id}, object_type="session")
-        else:
-            print(f"Session '{session.label}' already exists in destination. Renaming in source project")
-            timestamp = int(time.time() * 1000) % 1000
-            new_session_label = f"{session.label}_{timestamp}"
-            flywheel_modify_with_retry(
-                fw.modify_session, session.id, {"label": new_session_label}, object_type="session")
-            session = fw.get_session(session.id)
-            flywheel_modify_with_retry(
-                fw.modify_session, session.id, {"subject": destination_subject2.id}, object_type="session")
-    else:
-        print("couldnt find a destination subject in DQE:")
-        flywheel_modify_with_retry(
-            fw.modify_session, session.id, {"project": destination_project2.id}, object_type="session")
-
-#this is for regular study image submissions
-def handle_visit1_session(
-    fw, fw_client, session, subject, project, subject_label, session_label,
-    destination_project,
-):
-    acquisitions=session.acquisitions()
-    if not any(len(a.files) > 0 for a in list(acquisitions)):
-        return  # no files anywhere in the session, skip
-
-    found_oct = False
-
-    for acq in acquisitions:
-        if "oct" in acq.label.lower():
-            assignee = ""    #modify this
-            protocol_label = ""     #modify this
-        else:
-            assignee = ""       #modify this
-            protocol_label = ""    #modify this
-
-        if "oct" in acq.label.lower():
-
-            all_acqs = list(session.acquisitions())
-            oct_original = next((a for a in all_acqs if "oct" in a.label.lower() and "original" in a.label.lower()), None)
-            non_oct_original = next((a for a in all_acqs if "oct" in a.label.lower() and "original" not in a.label.lower()), None)
-
-            if "original" in acq.label.lower():
-                found_oct = True
-                resolve_and_move(
-                    fw, fw_client, acq, session, project, subject,
-                    destination_project, subject_label, session_label,
-                    protocol_label, assignee,
-                    also_move=non_oct_original, task_target="companion",
+    def session(self, subject, label):
+        """Existing destination session with this label, created if missing."""
+        with self._lock(subject.id):
+            sessions = self._sessions_of(subject)
+            if label not in sessions:
+                print(f"Creating session '{label}' under subject '{subject.label}'")
+                sid = self.fw.add_session(
+                    {"project": subject.project, "subject": subject.id, "label": label}
                 )
-            elif not found_oct and not oct_original:
-                # lone OCT acquisition with no "original" counterpart
-                resolve_and_move(
-                    fw, fw_client, acq, session, project, subject,
-                    destination_project, subject_label, session_label,
-                    protocol_label, assignee,
-                    also_move=None, task_target="self",
-                )
+                sessions[label] = SimpleNamespace(id=sid, label=label)
+                self._acq_labels[sid] = set()
+            return sessions[label]
 
-        elif "fp" in acq.label.lower():
-            resolve_and_move(
-                fw, fw_client, acq, session, project, subject,
-                destination_project, subject_label, session_label,
-                protocol_label, assignee,
-                also_move=None, task_target="self",
+    def move_session(self, session, subject):
+        """Move a whole session under subject, renaming it if the label is taken there."""
+        with self._lock(subject.id):
+            self._move_session_locked(session, subject)
+
+    def merge_target_or_move(self, session, subject):
+        """The destination session to merge into, or None after moving the session whole.
+
+        The check and the move happen under the subject's lock, so two sessions
+        arriving together still end up merged, as when the original handles them
+        one after the other.
+        """
+        with self._lock(subject.id):
+            existing = self._sessions_of(subject).get(session.label)
+            if existing is not None:
+                return existing
+            self._move_session_locked(session, subject)
+            return None
+
+    def _move_session_locked(self, session, subject):
+        sessions = self._sessions_of(subject)
+        label = free_label(session.label, sessions)
+        body = {"subject": subject.id}
+        if label != session.label:
+            print(
+                f"Session '{session.label}' already exists in destination, renaming to '{label}'"
+            )
+            body["label"] = label
+        print(f"Moving session '{session.label}' to subject '{subject.label}'")
+        self.fw.modify_session(session.id, body)
+        sessions[label] = session  # recorded only once the move succeeded
+
+    def move_acquisition(self, acq, dest_session, label):
+        """Move acq into dest_session as label (label_2, ... if taken): rename and move in one update."""
+        with self._lock(dest_session.id):
+            if dest_session.id not in self._acq_labels:
+                self._acq_labels[dest_session.id] = {
+                    a.label
+                    for a in read(self.fw.get_session_acquisitions, dest_session.id)
+                }
+            labels = self._acq_labels[dest_session.id]
+            new_label = free_label(label, labels)
+            if new_label != acq.label:
+                print(f"Acquisition '{acq.label}' will be renamed to '{new_label}'")
+            print(f"Moving acquisition '{new_label}' to session '{dest_session.label}'")
+            self.fw.modify_acquisition(
+                acq.id, {"session": dest_session.id, "label": new_label}
+            )
+            labels.add(new_label)  # recorded only once the move succeeded
+            acq.label = new_label  # create_task gets the renamed acquisition, as in the original
+
+    def full_session(self, session):
+        """The full session model, fetched once, for create_task (the original passed a reloaded session)."""
+        with self._lock(("full", session.id)):
+            if session.id not in self._full:
+                self._full[session.id] = read(self.fw.get_session, session.id)
+            return self._full[session.id]
+
+
+class Planner:
+    """Decides, per source session, what moves where. Destinations does the moving."""
+
+    def __init__(self, fw, destinations):
+        self.fw = fw
+        self.dest = destinations
+        self._projects = {}
+        self._projects_lock = threading.Lock()
+
+    def project(self, path):
+        """Destination project, looked up on first use (as in the original) and remembered."""
+        with self._projects_lock:
+            if path not in self._projects:
+                self._projects[path] = read(self.fw.lookup, path)
+            return self._projects[path]
+
+    def patient_information(self, session, subject_label, acqs):
+        viewer = (session.info or {}).get("ohifViewer")
+        if not isinstance(viewer, dict) or "read" not in viewer:
+            return [], False  # no viewer read yet: skip quietly, as the original does
+        reads = viewer["read"] or {}
+        first = next(iter(reads.values()), None)
+        if not first or str(first.get("readStatus")) != "Complete":
+            print(
+                f"Skipping {subject_label} / {session.label}: patient info is not complete"
+            )
+            return [], False
+        history = self.project(f"{SOURCE_GROUP}/Participant History")
+        dest_subject = self.dest.subject(history, subject_label)
+        return [("session", session, dest_subject)], True
+
+    def visit1(self, session, subject_label, acqs):
+        """Same selection as the original handle_visit1_session, in the same order.
+
+        `remaining` stands in for the original's fresh session.acquisitions() listing
+        inside the loop: acquisitions leave it as they are moved.
+        """
+        if not any(a.files for a in acqs):
+            return [], False
+        remaining = list(acqs)
+        found_oct = False
+        to_move = []  # (acquisition, task or None)
+        for acq in acqs:
+            lab = acq.label.lower()
+            if "oct" in lab:
+                task = (OCT_PROTOCOL_LABEL, OCT_ASSIGNEE)
+                oct_original = next(
+                    (
+                        a
+                        for a in remaining
+                        if "oct" in a.label.lower() and "original" in a.label.lower()
+                    ),
+                    None,
+                )
+                companion = next(
+                    (
+                        a
+                        for a in remaining
+                        if "oct" in a.label.lower()
+                        and "original" not in a.label.lower()
+                    ),
+                    None,
+                )
+                if "original" in lab:
+                    # the original moves with the first remaining non-original OCT; only the companion gets a task
+                    found_oct = True
+                    to_move.append((acq, None))
+                    remaining.remove(acq)
+                    if companion is not None:
+                        to_move.append((companion, task))
+                        remaining.remove(companion)
+                elif not found_oct and not oct_original:
+                    to_move.append((acq, task))  # lone OCT, no original in the session
+                    remaining.remove(acq)
+            elif "fp" in lab:
+                to_move.append((acq, (FP_PROTOCOL_LABEL, FP_ASSIGNEE)))
+                remaining.remove(acq)
+        if not to_move:
+            return [], False
+
+        dqe = self.project(f"{SOURCE_GROUP}/DQE")
+        dest_subject = self.dest.subject(dqe, subject_label)
+        dest_session = self.dest.session(dest_subject, session.label)
+        return [("acquisition", a, dest_session, a.label, t) for a, t in to_move], False
+
+    def uploader_acknowledgement(self, session, project, acqs):
+        if not any(a.files for a in acqs):
+            return [], False
+        review = self.project(f"{CERTIFICATION_GROUP}/Certification Review")
+        dest_subject = self.dest.subject(
+            review, f"ABID - {extract_prefix(project.label)}"
+        )
+        existing = self.dest.merge_target_or_move(session, dest_subject)
+        if existing is None:
+            return [], True  # moved whole
+        print(f"Session '{session.label}' already exists, moving its acquisitions")
+        return [("acquisition", a, existing, a.label, None) for a in acqs], False
+
+    def certification(self, session, subject_label, project, acqs):
+        with_files = [a for a in acqs if a.files]
+        if not with_files:
+            return [], False
+        review = self.project(f"{CERTIFICATION_GROUP}/Certification Review")
+        dest_subject = self.dest.subject(
+            review, f"ABID - {extract_prefix(project.label)}"
+        )
+        dest_label = (
+            "Equipment" if "equipment" in subject_label.lower() else subject_label
+        )
+        dest_session = self.dest.session(dest_subject, dest_label)
+        steps = []
+        for acq in with_files:
+            label = acq.label
+            initials = (extract_initials(f.name) for f in acq.files)
+            initial = next((i for i in initials if i and i not in label), None)
+            if initial:
+                label = f"{label}_{initial}"
+            steps.append(("acquisition", acq, dest_session, label, None))
+        return steps, False
+
+    def plan_session(self, session, project, acqs):
+        """(steps, delete): the moves for one source session, and whether it ends up empty."""
+        subject_label = session.subject.label if session.subject else "default"
+        label = session.label.lower()
+        moved_whole = False
+        steps = []
+        if session.label == "Patient Information":
+            steps, moved_whole = self.patient_information(session, subject_label, acqs)
+        elif "visit 1" in label:
+            steps, moved_whole = self.visit1(session, subject_label, acqs)
+        elif "uploader acknowledgement" in label:
+            steps, moved_whole = self.uploader_acknowledgement(session, project, acqs)
+        elif "certification" in label:
+            steps, moved_whole = self.certification(
+                session, subject_label, project, acqs
             )
 
+        moved_ids = {s[1].id for s in steps if s[0] == "acquisition"}
+        delete = not moved_whole and all(a.id in moved_ids for a in acqs)
+        return steps, delete
 
-def handle_uploader_acknowledgement_session(fw, session, project, session_label, destination_project3, group_ids2):
-    new_subject_label = f"ABID - {extract_prefix(project.label)}"
-    acquisitions=session.acquisitions()
-    for acq in acquisitions:
-        if len(acq.files) == 0:
+
+def source_projects(fw):
+    projects = []
+    for p in read(fw.get_group_projects, SOURCE_GROUP):
+        if p.label in EXCLUDED_PROJECTS or not p.label[:1].isdigit():
             continue
-
-        print(f'Found file in acquisition "{acq.label}"')
-        print(f'Moving session "{session_label}" to project "{destination_project3.label}"  ')
-
-        destination_subject = destination_project3.subjects.find_first(f'label="{new_subject_label}"')
-        if not destination_subject:
-            print(f"Creating subject '{new_subject_label}' in destination project")
-            destination_subject = destination_project3.add_subject(label=new_subject_label)
-            flywheel_modify_with_retry(
-                fw.modify_session, session.id, {"subject": destination_subject.id}, object_type="session")
-            return
-
-        existing_session = next((s for s in destination_subject.sessions() if s.label == session.label), None)
-        if not existing_session:
-            flywheel_modify_with_retry(
-                fw.modify_session, session.id, {"subject": destination_subject.id}, object_type="session")
-            return
-
-        print(f'Session "{session.label}" already exists.')
-        acquisitions=session.acquisitions()
-        for a in acquisitions:
-            print(f'Moving acquisition "{a.label}"')
-            rename_and_move_acquisition(fw, a, existing_session)
-        return
-
-
-def handle_certification_session(fw, session, subject_label, session_label, project, destination_project3):
-    if "equipment" in str(subject_label).lower():
-        new_subject_label = f"ABID - {extract_prefix(project.label)}"
-        new_session_label = "Equipment"
-    else:
-        new_subject_label = f"ABID - {extract_prefix(project.label)}"
-        new_session_label = subject_label
-
-    destination_subject = destination_project3.subjects.find_first(f'label="{new_subject_label}"')
-    if not destination_subject:
-        print(f"Creating subject '{new_subject_label}' in destination project")
-        destination_subject = destination_project3.add_subject(label=new_subject_label)
-    acquisitions=session.acquisitions()
-    for acquisition in acquisitions:
-        if len(acquisition.files) == 0:
+        # stats are computed asynchronously; when missing, process the project anyway
+        if p.stats and not p.stats.number_of.get("files"):
             continue
+        projects.append(p)
+    return projects
 
-        destination_session = destination_subject.sessions.find_first(f'label="{new_session_label}"')
-        if destination_session is None:
-            print(f"Creating session {new_session_label}")
-            destination_session = destination_subject.add_session(label=new_session_label)
 
-        new_acquisition_label = None
-        for file in acquisition.files:
-            initial = extract_initials(file.name)
-            if initial and initial not in acquisition.label:
-                new_acquisition_label = f"{acquisition.label}_{initial}"
-                flywheel_modify_with_retry(
-                    fw.modify_acquisition, acquisition.id, {"label": new_acquisition_label}, object_type="acquisition")
-                acquisition = fw.get_acquisition(acquisition.id)
-                break
+def project_sessions(fw, project_id):
+    """All sessions of a project, PAGE_SIZE at a time (paged by id)."""
+    after_id = None
+    while True:
+        kwargs = {"limit": PAGE_SIZE}
+        if after_id:
+            kwargs["after_id"] = after_id
+        page = read(fw.get_project_sessions, project_id, **kwargs)
+        yield from page
+        if len(page) < PAGE_SIZE:
+            return
+        after_id = page[-1].id
 
-        rename_and_move_acquisition(fw, acquisition, destination_session)
+
+def process_session(fw, fw_client, planner, project, session):
+    if session.label == "Patient Information":
+        session = read(fw.get_session, session.id)  # listings leave out info
+    acqs = read(fw.get_session_acquisitions, session.id)
+    steps, delete = planner.plan_session(session, project, acqs)
+    dest = planner.dest
+    for step in steps:  # moves first; the delete, if any, is always last
+        if step[0] == "session":
+            _, moving, dest_subject = step
+            dest.move_session(moving, dest_subject)
+        else:
+            _, acq, dest_session, label, task = step
+            dest.move_acquisition(acq, dest_session, label)
+            if task:
+                protocol_label, assignee = task
+                create_task(
+                    fw_client,
+                    acq,
+                    dest.full_session(dest_session),
+                    protocol_label,
+                    assignee,
+                )
+    if delete:
+        # Like the original, check the session is empty right before deleting it,
+        # so an upload that lands during the run is never deleted.
+        if read(fw.get_session_acquisitions, session.id):
+            print(
+                f"Session '{session.label}' ({session.id}) is no longer empty, not deleting it"
+            )
+            return
+        subject_label = session.subject.label if session.subject else "default"
+        print(
+            f"Session '{session.label}' of '{subject_label}' is now empty, deleting it"
+        )
+        fw.delete_session(
+            session.id, delete_reason=ContainerDeleteReason.CONTAINER_IS_EMPTY
+        )
 
 
 def main():
-    global api_key
-
-    delete_reason = ContainerDeleteReason.CONTAINER_IS_EMPTY
-
-    os.system("cls" if os.name == "nt" else "clear")
-    with open(api_key_path, "r") as f:
-        api_key = f.read()
-
-    fw = flywheel.Client(api_key)
-    fw_client = FWClient(api_key=api_key)
-
-    group_ids = [source_group_ID]
-    group_ids2 = [certification_group_ID]
-    destination_project3 = fw.lookup(f"{group_ids2[0]}/Certification Review")
-
-    source_projects = [
-        p for p in fw.projects()
-        if p.group == group_ids[0] and p.label not in excluded_projects and p.label[0].isdigit()
+    key, key_source = api_key()
+    print(
+        f"Site {key.split(':')[0]} (key from {key_source}); source group '{SOURCE_GROUP}', "
+        f"certification group '{CERTIFICATION_GROUP}'; {WORKERS} worker(s)"
+    )
+    empty = [
+        n
+        for n in (
+            "OCT_ASSIGNEE",
+            "OCT_PROTOCOL_LABEL",
+            "FP_ASSIGNEE",
+            "FP_PROTOCOL_LABEL",
+        )
+        if not globals()[n]
     ]
-    source_projects = [p for p in source_projects if p.stats.number_of["files"] > 0]
-    print("project_names:", [p.label for p in source_projects])
+    if empty:
+        print(
+            f"WARNING: {', '.join(empty)} empty at the top of this script; reader tasks will be created without them"
+        )
 
-    if not source_projects:
-        return
+    fw = flywheel.Client(key)
+    fw_client = FWClient(api_key=key)
+    planner = Planner(fw, Destinations(fw))
+    projects = source_projects(fw)
+    print("project_names:", [p.label for p in projects])
 
-    group = fw.groups.find_first(f'_id="{group_ids[0]}"')
-    if not group:
-        print(f"Group {group_ids} not found")
-        return
+    failures = []
+    pool = ThreadPoolExecutor(max(1, WORKERS))
+    try:
+        for project in projects:
+            futures = {
+                pool.submit(process_session, fw, fw_client, planner, project, s): s
+                for s in project_sessions(fw, project.id)
+            }
+            for future, session in futures.items():
+                try:
+                    future.result()
+                except Exception as e:  # keep going; report at the end
+                    failures.append((project.label, session.label, session.id, repr(e)))
+                    traceback.print_exc()
+    except BaseException:
+        # Ctrl-C, or an error in this thread: drop sessions that have not started and
+        # let the running ones (at most WORKERS) finish, so none is left half-moved.
+        print(
+            "Stopping: cancelling sessions that have not started, waiting for the running ones"
+        )
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    pool.shutdown()
 
-    for project in source_projects:
-        if project.stats.number_of["files"] == 0:
-            continue
-
-        source_project = next((p for p in group.projects() if p.label == project.label), None)
-        if not source_project:
-            print(f"Source project '{project}' not found")
-            continue
-
-        destination_project = fw.lookup(f"{group_ids[0]}/{destination_project_name}")
-        if not destination_project:
-            print(f"Destination project '{destination_project_name}' not found")
-            continue
-
-        for session in source_project.sessions():
-            subject = session.subject
-
-            session_label = session.label
-            subject_label = subject.label if subject else "default"
-
-            destination_subject = destination_project.subjects.find_first(f'label="{subject_label}"')
-            if not destination_subject: #currently it adds all of the subjects to the destination project on the first run, to help speed things up in future runs
-                print(f"Creating subject '{subject_label}' in destination project")
-                destination_project.add_subject(label=subject_label)
-            if session_label == "Patient Information":
-                handle_patient_information_session(fw, group_ids, session, subject, subject_label)
-
-            elif "visit 1" in str(session_label).lower():
-                handle_visit1_session(
-                    fw, fw_client, session, subject, project, subject_label, session_label,
-                    destination_project,
-                )
-
-            elif "uploader acknowledgement" in str(session_label).lower():
-                handle_uploader_acknowledgement_session(
-                    fw, session, project, session_label, destination_project3, group_ids2)
-
-            elif "certification" in str(session_label).lower():
-                handle_certification_session(
-                    fw, session, subject_label, session_label, project, destination_project3)
-
-            session = session.reload()
-            if len(session.acquisitions()) == 0:
-                print(f"The session at the source project is now empty, so it will be deleted: "
-                        f"{session.label} and subject {subject_label}")
-                fw.delete_session(session.id, delete_reason=delete_reason)
+    if failures:
+        print(f"{len(failures)} session(s) failed; re-run the script to retry them:")
+        for f in failures:
+            print("  ", *f)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
